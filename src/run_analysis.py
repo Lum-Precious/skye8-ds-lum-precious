@@ -3,6 +3,7 @@ from pathlib import Path
 import argparse
 import logging
 import pandas as pd
+import matplotlib.pyplot as plt
 
 
 @dataclass
@@ -214,6 +215,293 @@ def parse_arguments() -> Config:
     )
 
 
+def check_data_quality(
+        cell_sites: pd.DataFrame, sessions: pd.DataFrame, complaints: pd.DataFrame,
+        logger: logging.Logger) -> None:
+    logger.info("checkimg data quality")
+    logger.info(
+
+        "Sessions: %s rows, %s duplicate rows",
+
+        len(sessions),
+
+        sessions.duplicated().sum()
+
+    )
+
+    logger.info(
+
+        "Missing complaint resolution times: %s",
+
+        complaints["resolved_days"].isna().sum()
+
+    )
+
+    logger.info(
+
+        "Dropped values: %s",
+
+        sessions["dropped"].value_counts().to_dict()
+
+    )
+
+    logger.info(
+
+        "Throughput range: %.2f to %.2f Mbps",
+
+        sessions["throughput_mbps"].min(),
+
+        sessions["throughput_mbps"].max()
+
+    )
+
+    logger.info(
+
+        "Number of sites: %s",
+
+        len(cell_sites)
+    )
+
+
+def check_duplicates(
+        sessions: pd.DataFrame, logger: logging.Logger) -> None:
+    duplicate_count = sessions.duplicated(subset="session_id").sum()
+    logger.info("Duplicate session ids: %s", duplicate_count)
+
+
+def check_faulty_site(
+        sessions: pd.DataFrame, logger: logging.Logger
+) -> pd.DataFrame:
+
+    faulty = sessions[(sessions["throughput_mbps"] < 0)
+                      | (sessions["throughput_mbps"] > 1000)]
+    logger.info("Sessions with impossible throughput: %s", len(faulty))
+    if not faulty.empty:
+        logger.info("sites with impossible throughput:\n%s",
+                    faulty["site_id"].value_counts().to_string())
+        mean_with = sessions["throughput_mbps"].mean()
+        mean_without = sessions.loc[sessions["site_id"]
+                                    != "CS-0077", "throughput_mbps"].mean()
+        logger.info(
+            "Mean throughput with CS-0077: %.1f Mbps, without: %.1f Mbps", mean_with, mean_without)
+        sessions_clean = sessions[sessions["site_id"] != "CS-0077"].copy()
+        return sessions_clean
+
+
+def clean_timestamps(sessions, logger):
+    s = sessions["started_at"].astype(str)
+    unix_mask = s.str.fullmatch(r"\d{9,10}")
+    dmy_mask = s.str.fullmatch(r"\d{2}/\d{2}/\d{4} \d{2}:\d{2}")
+    iso_mask = ~(unix_mask | dmy_mask)
+    parsed = pd.Series(pd.NaT, index=sessions.index, dtype="datetime64[ns]")
+    parsed[unix_mask] = pd.to_datetime(s[unix_mask].astype(int), unit="s")
+    parsed[dmy_mask] = pd.to_datetime(s[dmy_mask], format="%d/%m/%Y %H:%M")
+    parsed[iso_mask] = pd.to_datetime(s[iso_mask], format="%Y-%m-%d %H:%M:%S")
+
+    sessions["started_at_parsed"] = parsed
+
+    return sessions
+
+
+def clean_durations(
+    sessions: pd.DataFrame,
+    logger: logging.Logger
+) -> pd.DataFrame:
+    sessions = sessions.copy()
+    sessions["duration_s"] = (
+        sessions["duration_s"]
+        .astype(str)
+        .str.replace(" s", "", regex=False)
+    )
+    sessions["duration_s"] = pd.to_numeric(
+        sessions["duration_s"],
+        errors="coerce"
+    )
+    logger.info(
+        "Invalid durations after conversion: %s",
+        sessions["duration_s"].isna().sum()
+    )
+    return sessions
+
+
+def clean_dropped(
+
+    sessions: pd.DataFrame,
+
+    logger: logging.Logger
+
+) -> pd.DataFrame:
+
+    sessions = sessions.copy()
+
+    sessions["dropped"] = sessions["dropped"].astype(
+        str).str.strip().str.lower()
+
+    sessions["dropped_flag"] = sessions["dropped"].map({
+        "true": 1,
+        "yes": 1,
+        "false": 0,
+        "no": 0
+
+    })
+
+    logger.info(
+
+        "Invalid dropped values: %s",
+
+        sessions["dropped_flag"].isna().sum())
+    return sessions
+
+
+def profile_data(
+    cell_sites: pd.DataFrame,
+    sessions: pd.DataFrame,
+    complaints: pd.DataFrame,
+    logger: logging.Logger
+) -> pd.DataFrame:
+
+    logger.info("Profiling all columns")
+
+    frames = {
+        "cell_sites": cell_sites,
+        "sessions": sessions,
+        "complaints": complaints
+    }
+
+    rows = []
+
+    for table_name, df in frames.items():
+
+        for column in df.columns:
+
+            series = df[column]
+
+            rows.append({
+                "table": table_name,
+                "column": column,
+                "dtype": str(series.dtype),
+                "missing": int(series.isna().sum()),
+                "unique": int(series.nunique()),
+                "min": series.min()
+                if pd.api.types.is_numeric_dtype(series)
+                else "",
+                "max": series.max()
+                if pd.api.types.is_numeric_dtype(series)
+                else ""
+            })
+
+    profile = pd.DataFrame(rows)
+
+    logger.info("Profile completed")
+
+    return profile
+
+
+def create_eda_figures(
+    sessions: pd.DataFrame,
+    config: Config,
+    logger: logging.Logger
+) -> None:
+
+    logger.info("Creating EDA figures")
+
+    config.figures_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    clean_sessions = sessions[
+        (sessions["throughput_mbps"] >= 0)
+        & (sessions["throughput_mbps"] <= 1000)
+        & (sessions["duration_s"] > 0)
+        & (sessions["duration_s"] <= 3600)
+    ].copy()
+
+    plt.figure(figsize=(8, 5))
+    clean_sessions["throughput_mbps"].hist(bins=50)
+    plt.xlabel("Throughput (Mbps)")
+    plt.ylabel("Sessions")
+    plt.title("Throughput Distribution")
+    plt.xlim(0, 200)
+    plt.tight_layout()
+    plt.savefig(
+        config.figures_dir / "throughput_distribution.png"
+    )
+    plt.close()
+
+    plt.figure(figsize=(8, 5))
+    clean_sessions["duration_s"].hist(bins=50)
+    plt.xlabel("Duration (seconds)")
+    plt.ylabel("Sessions")
+    plt.title("Session Duration Distribution")
+    plt.xlim(0, 600)
+    plt.tight_layout()
+    plt.savefig(
+        config.figures_dir / "duration_distribution.png"
+    )
+    plt.close()
+
+    drop_by_device = (
+        sessions.groupby("device_type")["dropped_flag"]
+        .mean()
+        .mul(100)
+    )
+
+    plt.figure(figsize=(8, 5))
+    drop_by_device.plot(kind="bar")
+    plt.xlabel("Device Type")
+    plt.ylabel("Drop Rate (%)")
+    plt.title("Drop Rate by Device Type")
+    plt.tight_layout()
+    plt.savefig(
+        config.figures_dir / "drop_rate_by_device.png"
+    )
+    plt.close()
+
+    logger.info("EDA figures saved")
+
+
+def distribution_stats(
+    series: pd.Series, name: str, logger: logging.Logger
+) -> dict:
+    mean, median = series.mean(), series.median()
+    skew = series.skew()
+    stats = {
+        "metric": name,
+        "mean": round(mean, 2),
+        "median": round(median, 2),
+        "q1": round(series.quantile(0.25), 2),
+        "q3": round(series.quantile(0.75), 2),
+        "skew": round(skew, 2),
+        "recommended_stat": "median" if abs(skew) > 1 else "mean",
+    }
+    logger.info("Distribution stats for %s: %s", name, stats)
+    return stats
+
+
+def drop_rate_breakdowns(
+    sessions: pd.DataFrame, cell_sites: pd.DataFrame, logger: logging.Logger
+) -> dict[str, pd.DataFrame]:
+    df = sessions.merge(
+        cell_sites[["site_id", "region", "backhaul"]],
+        on="site_id", how="left", validate="m:1",
+    )
+    df["hour"] = df["started_at_parsed"].dt.hour
+
+    factors = ["hour", "region", "device_type", "backhaul"]
+    results = {}
+    for factor in factors:
+        table = (
+            df.groupby(factor)["dropped_flag"]
+            .agg(sessions="count", drop_rate="mean")
+            .reset_index()
+        )
+        logger.info("Drop rate by %s:\n%s", factor,
+                    table.to_string(index=False))
+        results[factor] = table
+    return results
+
+
 def main() -> None:
 
     logger = setup_logging()
@@ -228,9 +516,24 @@ def main() -> None:
     )
     # Complaints will be used in later stages.
     _ = complaints
+    check_data_quality(
+        cell_sites, sessions, complaints, logger
+    )
+    sessions = clean_timestamps(sessions, logger)
+    sessions = clean_durations(sessions, logger)
+    sessions = clean_dropped(sessions, logger)
+    profile = profile_data(cell_sites, sessions, complaints, logger)
+    create_eda_figures(sessions, config, logger)
+    check_duplicates(sessions, logger)
+    sessions = check_faulty_site(sessions, logger)
+    throughput_stats = distribution_stats(
+        sessions["throughput_mbps"], "throughput_mbps", logger)
+    duration_stats = distribution_stats(
+        sessions["duration_s"], "duration_s", logger)
+    breakdown = drop_rate_breakdowns(sessions, cell_sites, logger)
+
     operator_table = reproduce_operator_table(
-        sessions,
-        cell_sites,
+        sessions, cell_sites,
         logger
     )
     save_operator_table(
