@@ -502,6 +502,113 @@ def drop_rate_breakdowns(
     return results
 
 
+def drop_rate_by_region_and_tech(
+    sessions: pd.DataFrame, cell_sites: pd.DataFrame, logger: logging.Logger
+) -> pd.DataFrame:
+    df = sessions.merge(
+        cell_sites[["site_id", "region", "technology"]],
+        on="site_id", how="left", validate="m:1",
+    )
+    table = (
+        df.groupby(["region", "technology"])["dropped_flag"]
+        .agg(session="count", drop_rate="mean")
+        .reset_index()
+    )
+    table["drop_rate_pct"] = (table["drop_rate"] * 100). round(2)
+    logger.info("Drop rate by region and technology:\n%s",
+                table.to_string(index=False))
+    return table
+
+
+def tech_distribution_by_region(
+    sessions: pd.DataFrame, cell_sites: pd.DataFrame, logger: logging.Logger
+) -> pd.DataFrame:
+    df = sessions.merge(
+        cell_sites[["site_id", "region", "technology"]],
+        on="site_id", how="left", validate="m:1",
+    )
+    counts = df.groupby(["region", "technology"]). size().unstack(fill_value=0)
+    pct = counts.div(counts.sum(axis=1), axis=0).mul(100).round(1)
+    logger.info("technology mix by region(%% of session):\n%s",
+                pct.to_string())
+    return pct
+
+
+def region_technology_analysis(
+    sessions: pd.DataFrame,
+    cell_sites: pd.DataFrame,
+    logger: logging.Logger
+) -> pd.DataFrame:
+
+    logger.info("Calculating region and technology drop rates")
+
+    data = sessions.merge(
+        cell_sites[["site_id", "region", "technology"]],
+        on="site_id",
+        how="left"
+    )
+
+    table = (
+        data.groupby(["region", "technology"])
+        .agg(
+            sessions=("session_id", "count"),
+            dropped=("dropped_flag", "sum")
+        )
+        .reset_index()
+    )
+
+    table["drop_rate_pct"] = (
+        table["dropped"] / table["sessions"] * 100
+    ).round(2)
+
+    logger.info(
+        "Region and technology analysis completed"
+    )
+
+    return table
+
+
+def plot_regional_4g_vs_5g(
+    region_tech_table: pd.DataFrame,
+    figures_dir: Path,
+    logger: logging.Logger
+) -> None:
+
+    logger.info("Creating regional 4G versus 5G drop-rate chart")
+
+    comparison = region_tech_table[
+        region_tech_table["technology"].isin(["4G", "5G"])
+    ].copy()
+
+    pivot = comparison.pivot(
+        index="region",
+        columns="technology",
+        values="drop_rate_pct"
+    )
+
+    ax = pivot.plot(
+        kind="bar",
+        figsize=(10, 6)
+    )
+
+    ax.set_title("4G vs 5G Drop Rate by Region")
+    ax.set_xlabel("Region")
+    ax.set_ylabel("Drop Rate (%)")
+    ax.legend(title="Technology")
+
+    fig = ax.get_figure()
+    fig.tight_layout()
+
+    output_path = figures_dir / "regional_4g_vs_5g_drop_rate.png"
+    fig.savefig(output_path)
+    plt.close(fig)
+
+    logger.info(
+        "Saved regional comparison chart to %s",
+        output_path
+    )
+
+
 def main() -> None:
 
     logger = setup_logging()
@@ -531,6 +638,19 @@ def main() -> None:
     duration_stats = distribution_stats(
         sessions["duration_s"], "duration_s", logger)
     breakdown = drop_rate_breakdowns(sessions, cell_sites, logger)
+    region_tech_table = drop_rate_by_region_and_tech(
+        sessions, cell_sites, logger)
+    tech_mix = tech_distribution_by_region(
+        sessions, cell_sites, logger)
+    region_tech_table = region_technology_analysis(
+        sessions, cell_sites, logger)
+    region_tech_table = region_technology_analysis(
+        sessions,
+        cell_sites,
+        logger
+    )
+
+    plot_regional_4g_vs_5g(region_tech_table, config.figures_dir, logger)
 
     operator_table = reproduce_operator_table(
         sessions, cell_sites,
