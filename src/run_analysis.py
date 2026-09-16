@@ -1,3 +1,6 @@
+import numpy as np
+from scipy.stats import mannwhitneyu
+from statsmodels.stats.proportion import proportions_ztest
 from dataclasses import dataclass
 from pathlib import Path
 import argparse
@@ -156,24 +159,15 @@ def save_operator_table(
         file.write(
 
             "| Technology | Sessions | Dropped | Drop Rate |\n"
-
         )
         for _, row in table.iterrows():
-
             file.write(
-
                 f"| {row['technology']} "
-
                 f"| {row['sessions']:,} "
-
                 f"| {row['dropped']:,} "
-
                 f"| {row['drop_rate_pct']:.2f}% |\n"
-
             )
-
         file.write("\n")
-
     logger.info(
 
         "Operator table saved to %s",
@@ -609,6 +603,275 @@ def plot_regional_4g_vs_5g(
     )
 
 
+def compare_4g_5g_by_region(
+    region_tech_table: pd.DataFrame,
+    logger: logging.Logger
+) -> pd.DataFrame:
+    """Compare 4G and 5G drop rates within each region."""
+
+    logger.info("Performing 4G versus 5G statistical comparisons")
+
+    results = []
+
+    for region in region_tech_table["region"].unique():
+
+        region_data = region_tech_table[
+            (region_tech_table["region"] == region)
+            & (region_tech_table["technology"].isin(["4G", "5G"]))
+        ]
+
+        if set(region_data["technology"]) != {"4G", "5G"}:
+            continue
+
+        row_4g = region_data[
+            region_data["technology"] == "4G"
+        ].iloc[0]
+
+        row_5g = region_data[
+            region_data["technology"] == "5G"
+        ].iloc[0]
+
+        difference = (
+            row_5g["drop_rate_pct"]
+            - row_4g["drop_rate_pct"]
+        )
+
+        results.append(
+            {
+                "region": region,
+                "4g_drop_rate_pct": row_4g["drop_rate_pct"],
+                "5g_drop_rate_pct": row_5g["drop_rate_pct"],
+                "difference_5g_minus_4g_pct": round(
+                    difference, 2
+                ),
+            }
+        )
+
+    results_df = pd.DataFrame(results)
+
+    logger.info(
+        "4G versus 5G regional comparison completed"
+    )
+
+    return results_df
+
+
+def statistical_test_4g_5g(
+    region_tech_table: pd.DataFrame,
+    logger: logging.Logger
+) -> pd.DataFrame:
+    """Compare 4G and 5G drop rates by region with confidence intervals."""
+    from statsmodels.stats.proportion import proportions_ztest
+    from statsmodels.stats.multitest import multipletests
+    import math
+
+    logger.info("Running regional 4G versus 5G statistical tests")
+
+    results = []
+
+    for region in region_tech_table["region"].unique():
+
+        region_data = region_tech_table[
+            (region_tech_table["region"] == region)
+            & (region_tech_table["technology"].isin(["4G", "5G"]))
+        ]
+
+        if set(region_data["technology"]) != {"4G", "5G"}:
+            continue
+
+        row_4g = region_data[
+            region_data["technology"] == "4G"
+        ].iloc[0]
+
+        row_5g = region_data[
+            region_data["technology"] == "5G"
+        ].iloc[0]
+
+        dropped_4g = int(row_4g["dropped"])
+        dropped_5g = int(row_5g["dropped"])
+
+        sessions_4g = int(row_4g["sessions"])
+        sessions_5g = int(row_5g["sessions"])
+
+        p4g = dropped_4g / sessions_4g
+        p5g = dropped_5g / sessions_5g
+
+        difference = p5g - p4g
+
+        z_stat, p_value = proportions_ztest(
+            [dropped_5g, dropped_4g],
+            [sessions_5g, sessions_4g]
+        )
+
+        se = math.sqrt(
+            (p5g * (1 - p5g) / sessions_5g)
+            + (p4g * (1 - p4g) / sessions_4g)
+        )
+
+        margin = 1.96 * se
+
+        ci_low = difference - margin
+        ci_high = difference + margin
+
+        results.append({
+            "region": region,
+            "4g_drop_rate_pct": round(p4g * 100, 2),
+            "5g_drop_rate_pct": round(p5g * 100, 2),
+            "difference_pct": round(difference * 100, 2),
+            "ci_low_pct": round(ci_low * 100, 2),
+            "ci_high_pct": round(ci_high * 100, 2),
+            "z_statistic": round(z_stat, 3),
+            "p_value": p_value
+        })
+
+    results_df = pd.DataFrame(results)
+
+    # Holm correction for multiple comparisons
+    if not results_df.empty:
+        reject, adjusted_p, _, _ = multipletests(
+            results_df["p_value"],
+            method="holm"
+        )
+
+        results_df["adjusted_p_value"] = adjusted_p
+        results_df["significant_after_holm"] = reject
+
+    logger.info(
+        "Regional statistical tests completed:\n%s",
+        results_df.to_string(index=False)
+    )
+
+    return results_df
+
+
+def statistical_test_throughput(
+    sessions: pd.DataFrame,
+    cell_sites: pd.DataFrame,
+    logger: logging.Logger,
+    n_bootstraps: int = 1000,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Compare 4G and 5G throughput using Mann-Whitney U with bootstrapped CIs."""
+    logger.info("Running 4G versus 5G throughput statistical test")
+
+    data = sessions.merge(
+        cell_sites[["site_id", "technology"]], on="site_id", how="left"
+    )
+
+    data = data[
+        (data["site_id"] != "CS-0077")
+        & (data["technology"].isin(["4G", "5G"]))
+        & (data["throughput_mbps"].notna())
+        & (data["throughput_mbps"] >= 0)
+    ].copy()
+
+    t_4g = data.loc[data["technology"] == "4G", "throughput_mbps"].values
+    t_5g = data.loc[data["technology"] == "5G", "throughput_mbps"].values
+    u_stat, p_val = mannwhitneyu(t_4g, t_5g, alternative="two-sided")
+
+    med_4g = np.median(t_4g)
+    med_5g = np.median(t_5g)
+    obs_diff = med_5g - med_4g
+
+    rng = np.random.default_rng(random_state)
+    boot_diffs = np.empty(n_bootstraps)
+
+    for i in range(n_bootstraps):
+        boot_4g = rng.choice(t_4g, size=len(t_4g), replace=True)
+        boot_5g = rng.choice(t_5g, size=len(t_5g), replace=True)
+        boot_diffs[i] = np.median(boot_5g) - np.median(boot_4g)
+
+    ci_low = np.percentile(boot_diffs, 2.5)
+    ci_high = np.percentile(boot_diffs, 97.5)
+
+    results = pd.DataFrame(
+        [
+            {
+                "metric": "Throughput (Mbps)",
+                "median_4g": med_4g,
+                "median_5g": med_5g,
+                "median_diff": obs_diff,
+                "ci_low": ci_low,
+                "ci_high": ci_high,
+                "u_statistic": u_stat,
+                "p_value": p_val,
+            }
+        ]
+    )
+
+    logger.info("4G median throughput: %.2f Mbps", med_4g)
+    logger.info("5G median throughput: %.2f Mbps", med_5g)
+    logger.info(
+        "Throughput Diff (5G - 4G): %.2f Mbps [95%% CI: %.2f, %.2f]",
+        obs_diff,
+        ci_low,
+        ci_high,
+    )
+    logger.info("Mann-Whitney U statistic: %.2f, p-value: %.6g", u_stat, p_val)
+
+    return results
+
+
+def peak_offpeak_analysis(
+    sessions: pd.DataFrame,
+    logger: logging.Logger,
+) -> pd.DataFrame:
+    """Compare drop rates during peak and off-peak hours."""
+
+    logger.info("Running peak versus off-peak analysis")
+
+    data = sessions.copy()
+
+    data["started_at"] = pd.to_datetime(clean_timestamps(data, logger)[
+                                        "started_at"], errors="coerce")
+    data["hour"] = data["started_at"].dt.hour
+
+    data["period"] = np.where(
+        data["hour"].between(8, 19),
+        "Peak",
+        "Off-peak"
+    )
+
+    results = []
+
+    for period in ["Peak", "Off-peak"]:
+        subset = data[data["period"] == period]
+
+        sessions_count = len(subset)
+        dropped = int(subset["dropped_flag"].sum())
+
+        rate = dropped / sessions_count
+
+        se = np.sqrt(
+            rate * (1 - rate) / sessions_count
+        )
+
+        margin = 1.96 * se
+
+        ci_low = max(0, rate - margin)
+        ci_high = min(1, rate + margin)
+
+        results.append({
+            "period": period,
+            "sessions": sessions_count,
+            "dropped": dropped,
+            "drop_rate_pct": round(rate * 100, 2),
+            "ci_low_pct": round(ci_low * 100, 2),
+            "ci_high_pct": round(ci_high * 100, 2),
+        })
+
+    results_df = pd.DataFrame(results)
+
+    logger.info(
+        "Peak versus off-peak results:\n%s",
+        results_df.to_string(index=False)
+    )
+
+    logger.info("Peak/off-peak analysis completed")
+
+    return results_df
+
+
 def main() -> None:
 
     logger = setup_logging()
@@ -651,6 +914,9 @@ def main() -> None:
     )
 
     plot_regional_4g_vs_5g(region_tech_table, config.figures_dir, logger)
+    statistical_results = statistical_test_4g_5g(region_tech_table, logger)
+    throughput_df = statistical_test_throughput(sessions,  cell_sites, logger)
+    peak_results = peak_offpeak_analysis(sessions, logger)
 
     operator_table = reproduce_operator_table(
         sessions, cell_sites,
